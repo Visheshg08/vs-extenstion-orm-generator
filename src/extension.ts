@@ -67,6 +67,61 @@ function detectDatabase(sql: string): "Postgres" | "MySQL" | "SQLite" {
   return "Postgres"; // default fallback
 }
 
+function applyAlterFksFromSql(sql: string, tables: TableSchema[]) {
+  // Handles: ALTER TABLE child ADD [CONSTRAINT name] FOREIGN KEY (c1, c2) REFERENCES parent(p1, p2) ...
+  // Works for MySQL/SQLite (and generally dialect-agnostic).
+  const IDENT = String.raw`(?:"[^"]+"|` + "`[^`]+`" + String.raw`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_$]*)`;
+  const QUALIFIED = `${IDENT}(?:\\.${IDENT})?`;
+
+  const ALTER_FK_RE = new RegExp(
+    String.raw`alter\s+table\s+(?<table>${QUALIFIED})\s+add\s+(?:constraint\s+(?<cname>${IDENT})\s+)?foreign\s+key\s*\((?<cols>[^)]+)\)\s+references\s+(?<reftable>${QUALIFIED})\s*\((?<refcols>[^)]+)\)`,
+    "ig"
+  );
+
+  const norm = (s: string) =>
+    s.trim()
+      .replace(/^`([^`]*)`$/,"$1")
+      .replace(/^"([^"]*)"$/,"$1")
+      .replace(/^\[([^\]]*)\]$/,"$1");
+
+  const splitCols = (list: string) =>
+    list.split(",").map(s => norm(s).toLowerCase().trim());
+
+  const findTable = (name: string) => {
+    const clean = norm(name);
+    // Try exact, then case-insensitive match
+    let t = tables.find(t => t.name === clean);
+    if (!t) t = tables.find(t => t.name.toLowerCase() === clean.toLowerCase());
+    return t;
+  };
+
+  for (const m of sql.matchAll(ALTER_FK_RE)) {
+    const childTableName = m.groups!.table!;
+    const parentTableName = m.groups!.reftable!;
+    const childCols = splitCols(m.groups!.cols!);
+    const parentCols = splitCols(m.groups!.refcols!);
+
+    const child = findTable(childTableName);
+    if (!child) continue;
+
+    // Mark child columns as foreign + reference mapping
+    for (let i = 0; i < childCols.length; i++) {
+      const cName = childCols[i];
+      const pCol = parentCols[i] ?? parentCols[0];
+      const col = child.columns.find(c => c.name.toLowerCase() === cName);
+      if (!col) continue;
+
+      col.isForeign = true;
+      // keep existing if composite appears over multiple constraints
+      col.references = {
+        table: norm(parentTableName),
+        column: pCol
+      };
+    }
+  }
+}
+
+
 export class SQLParser {
   private nodeParser = new NodeSQLParser();
 
@@ -213,6 +268,7 @@ export class SQLParser {
             tables.push(table);
           }
         });
+        applyAlterFksFromSql(sql, tables);
       }
     });
 
@@ -227,49 +283,77 @@ function generateMermaidERD(schemas: TableSchema[], relations: TableRelation[]):
       }`;
   }
 
+  // --- 1) de-dupe entities by name (case-insensitive) ---
+  const tableMap = new Map<string, TableSchema>();
+  for (const t of schemas) {
+    const key = t.name.trim().toUpperCase();
+    if (!tableMap.has(key)) tableMap.set(key, t);
+  }
+  const tables = Array.from(tableMap.values());
+
+  // --- 2) sanitize relation labels so Mermaid doesn't parse tokens inside them ---
+  const safeLabel = (s: string) =>
+    (s || "")
+      .replace(/--/g, "—")    // em-dash instead of double hyphen
+      .replace(/[{}[\]|]/g, "") // remove ER connector tokens
+      .replace(/->/g, "→")    // unicode arrow
+      .replace(/</g, "‹").replace(/>/g, "›"); // angle quotes
+
   let erd = "erDiagram\n";
 
-  // Tables + columns
-  schemas.forEach((table) => {
+  // Entities + fields
+  tables.forEach((table) => {
     erd += `  ${table.name.toUpperCase()} {\n`;
-
     table.columns.forEach((col) => {
-      let type = col.type.toUpperCase();
+      const type = (col.type || "UNKNOWN").toUpperCase();
+      const badges: string[] = [];
       const extras: string[] = [];
-
-      if (col.isPrimary) extras.push("PK");
-      if (col.isForeign) extras.push("FK");
-
-      erd += `    ${type} ${col.name}${extras.length ? " " + extras.join(" ") : ""}\n`;
+      if (col.isPrimary) {
+        badges.push("PK");
+      } else if (col.isForeign) {
+        badges.push("FK");
+      }
+      erd += `    ${type} ${col.name}${badges.length ? " " + badges.join(" ") : ""}\n`;
     });
-
     erd += "  }\n";
   });
 
-  // Relationships from external "relationships.*" file
+  // External relationships.* (must include a label)
   relations.forEach((rel) => {
-    let arrow = rel.type.includes("many") ? "||--o{" : "||--||";
-    erd += `  ${rel.targetTable.toUpperCase()} ${arrow} ${rel.sourceTable.toUpperCase()}\n`;
+    const arrow = rel.type.toLowerCase().includes("many") ? "||--o{" : "||--||";
+    const label = safeLabel(rel.name || rel.type || "rel");
+    erd += `  ${rel.targetTable.toUpperCase()} ${arrow} ${rel.sourceTable.toUpperCase()} : ${label}\n`;
   });
 
-  // Relationships from detected FKs in schema
+  // FK-detected relationships (add a short, safe label)
   schemas.forEach((table) => {
-    table.columns.forEach((col) => {
-      if (col.isForeign && col.references) {
-        let arrow = "||--o{"; // default = one-to-many
+  const pkCount = table.columns.filter(c => c.isPrimary).length; // <-- add
 
-        // detect one-to-one
-        if (col.isPrimary || col.isUnique) {
-          arrow = "||--||";
-        }
+  table.columns.forEach((col) => {
+  if (col.isForeign && col.references) {
+    const pkCols = table.columns.filter(c => c.isPrimary).map(c => c.name);
 
-        erd += `  ${col.references.table.toUpperCase()} ${arrow} ${table.name.toUpperCase()}\n`;
-      }
-    });
-  });
+    // One-to-one if:
+    // 1. FK is explicitly UNIQUE
+    // 2. OR FK is the ONLY PK column (sole primary key of the table)
+    const isOneToOne =
+      !!col.isUnique ||
+      (col.isPrimary && pkCols.length === 1);
+
+    const arrow = isOneToOne ? "||--||" : "||--o{";
+
+    const parent = col.references.table.toUpperCase();
+    const child  = table.name.toUpperCase();
+    const label  = `${col.name}→${col.references.column}`;
+
+    erd += `  ${parent} ${arrow} ${child} : ${label}\n`;
+  }
+});
+});
 
   return erd;
 }
+
 
 
 
